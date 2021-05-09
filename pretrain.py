@@ -16,24 +16,22 @@ dataset_val = CnnDmDataset('validation')
 
 
 
-# BATCH_SIZE = 6
-# BATCH_SIZE = 2
-# BATCH_SIZE = 3
-BATCH_SIZE = 6
-BATCH_SIZE = 4
-# BATCH_SIZE_TEST = 5
-BATCH_SIZE_TEST = 16
-BATCH_SIZE_TEST = 14
+BATCH_SIZE = 6  # no gat 2080ti
+# BATCH_SIZE = 4  # gat 2080ti
+# BATCH_SIZE = 14   # gat 3090
+BATCH_SIZE_TEST = 20  # no gat 2080ti
+# BATCH_SIZE_TEST = 15  # gat 2080ti
+# BATCH_SIZE_TEST = 24  # gat 3090
 
 
-dataloader_train = DataLoader(dataset_train, batch_size=BATCH_SIZE, shuffle=True, num_workers=16, collate_fn=CnnDmDataset.collate_fn)
-dataloader_val = DataLoader(dataset_val, batch_size=BATCH_SIZE_TEST, shuffle=True, num_workers=8, collate_fn=CnnDmDataset.collate_fn)
+dataloader_train = DataLoader(dataset_train, batch_size=BATCH_SIZE, shuffle=True, num_workers=20, collate_fn=CnnDmDataset.collate_fn)
+dataloader_val = DataLoader(dataset_val, batch_size=BATCH_SIZE_TEST, shuffle=True, num_workers=10, collate_fn=CnnDmDataset.collate_fn)
 
 
 
 from models import get_model
-
-tokenizer, model = get_model(graph=True, encoders=6, decoders=6, shared_head=True, pretrained=False)
+GRAPH = False
+tokenizer, model = get_model(graph=GRAPH, encoders=6, decoders=6, shared_head=True, pretrained=False)
 
 
 
@@ -55,9 +53,9 @@ from transformers import AdamW, Adafactor, get_cosine_schedule_with_warmup, get_
 
 MAX_INPUT = 512
 MAX_OUTPUT = 256
-LR = 1e-4
+LR = 1e-5
 # LR = 0.1
-EPOCHS = 60
+EPOCHS = 20
 start_epoch = 0
 DEVICE = 'cuda'
 # DEVICE = 'cpu'
@@ -73,19 +71,21 @@ scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=1024, nu
 # scheduler = None
 
 
-CHECKPOINT = 'model-best-e6-g3-d6'
+CHECKPOINT = 'model-best-e6-g3-d6' if GRAPH else 'model-best-e6-g0-d6'
 # CHECKPOINT = None
 # CHECKPOINT = 'model-e_3-l_3.7768'
 if CHECKPOINT is not None:
     print(f'LOADING checkpoint <{CHECKPOINT}>...')
     checkpoint = torch.load(f'pre-checkpoints/{CHECKPOINT}.pt')
     model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    if 'optimizer_state_dict' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     start_epoch = checkpoint['epoch']
     loss = checkpoint['loss'] if 'loss' in checkpoint else None
     print(f'    saved loss: {loss}')
 
-# optimizer = Adafactor(model.parameters(), scale_parameter=True, relative_step=False, warmup_init=False, lr=LR)
+# optimizer = Adafactor(model.parameters(), scale_parameter=False, relative_step=False, warmup_init=False, lr=LR)
+# optimizer = Adafactor(model.parameters(), warmup_init=True)
 # optimizer = AdamW(model.parameters(), lr=LR)
 
 start_epoch = 0
@@ -122,10 +122,9 @@ run["parameters"] = {
     "criterion": "CrossEntropyLoss",
     "optimizer": type(optimizer).__name__,
     "scheduler": type(scheduler).__name__ if scheduler else None,
-    "model": "pegasus+gat",
-    # "model": "pegasus",
+    "model": "pegasus+gat" if GRAPH else "pegasus",
     "encoders": model.config.encoder_layers,
-    "gat": 3,
+    "gat": 3 if GRAPH else 0,
     "decoders": model.config.decoder_layers,
 }
 
@@ -149,13 +148,14 @@ word_mask = tokenizer.init_kwargs['mask_token']
 print(f'sent_mask {sent_mask}   word_mask {word_mask}')
 
 sent_percentage = 0.15
+word_percentage = 0.15
 
 import random
 import nltk
 from nltk import tokenize
 nltk.download('punkt')
 def get_data(articles):
-    input_data, output_data = [], []
+    encoder_input, decoder_target = [], []
 
     for article in articles:
         article_sents = tokenize.sent_tokenize(article)
@@ -166,10 +166,10 @@ def get_data(articles):
         for i in drop_ids:
             article_sents[i] = sent_mask
 
-        input_data.append(' '.join(article_sents))
-        output_data.append(' '.join(predict_sent))
+        encoder_input.append(' '.join(article_sents))
+        decoder_target.append(' '.join(predict_sent))
 
-    return input_data, output_data
+    return encoder_input, decoder_target
 
 
 
@@ -194,8 +194,16 @@ def train_dataset(model, dataloader, scaler, criterion, optimizer, scheduler, ru
         decoder_input_ids = model.prepare_decoder_input_ids_from_labels(target_tokens['input_ids'])
 
         with torch.cuda.amp.autocast():
-            outputs = model(**input_tokens, decoder_input_ids=decoder_input_ids, input_nodes_embeddings=node_features, input_edges=topology)
-            loss = criterion(outputs.logits, target_tokens['input_ids'], target_tokens['attention_mask'])
+            try:
+                outputs = model(**input_tokens, decoder_input_ids=decoder_input_ids, input_nodes_embeddings=node_features, input_edges=topology)
+                loss = criterion(outputs.logits, target_tokens['input_ids'], target_tokens['attention_mask'])
+            except RuntimeError:
+                for k, v in input_tokens.items(): del v
+                for k, v in target_tokens.items(): del v
+                for v in node_features: del v
+                for v in topology: del v
+                del decoder_input_ids
+                continue
 
         if torch.isnan(loss).any():
             print('loss NAN')
@@ -238,13 +246,13 @@ def train_dataset(model, dataloader, scaler, criterion, optimizer, scheduler, ru
         if i % 8 == 0:
             torch.cuda.empty_cache()
 
-        if i > _break:
+        if _break is not None and i > _break:
             break
 
 
 
 @torch.no_grad()
-def test_dataset(model, dataloader, run, DEVICE, _type='val', _break=64+32):
+def test_dataset(model, dataloader, run, DEVICE, _type='val', _break=64):
     model.eval()
 
     val_runnig_loss, val_runnig_num = 0, 0
@@ -281,7 +289,7 @@ def test_dataset(model, dataloader, run, DEVICE, _type='val', _break=64+32):
         if i % 8 == 0:
             torch.cuda.empty_cache()
 
-        if i > _break:
+        if _break is not None and i > _break:
             break
 
     run[f"{_type}/loss"].log(val_runnig_loss / val_runnig_num)

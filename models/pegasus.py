@@ -45,14 +45,6 @@ class PegasusSuperDecoderLayer(PegasusDecoderLayer):
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
 
-        if torch.isnan(encoder_hidden_states).any():
-            print('encoder_hidden_states NAN \n')
-        if torch.isnan(gat_hidden_states).any():
-            print('gat_hidden_states NAN \n')
-
-        if torch.isnan(hidden_states).any():
-            print('111 hidden_states NAN \n')
-
         # Self Attention
         # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
         self_attn_past_key_value = past_key_value[:2] if past_key_value is not None else None
@@ -66,9 +58,6 @@ class PegasusSuperDecoderLayer(PegasusDecoderLayer):
         )
         hidden_states = F.dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = residual + hidden_states
-
-        if torch.isnan(hidden_states).any():
-            print('222 hidden_states NAN \n')
 
         # Cross-Attention Block
         cross_attn_present_key_value = None
@@ -101,9 +90,6 @@ class PegasusSuperDecoderLayer(PegasusDecoderLayer):
             # add cross-attn to positions 3,4 of present_key_value tuple
             present_key_value = present_key_value + cross_attn_present_key_value
 
-        if torch.isnan(hidden_states).any():
-            print('333 hidden_states NAN \n')
-
         # Cross-Attention Block for GAT
         gat_cross_attn_present_key_value = None
         gat_cross_attn_weights = None
@@ -127,9 +113,6 @@ class PegasusSuperDecoderLayer(PegasusDecoderLayer):
 
             # add cross-attn to positions 5,6 of present_key_value tuple
             present_key_value = present_key_value + gat_cross_attn_present_key_value
-
-        if torch.isnan(hidden_states).any():
-            print('444 hidden_states NAN \n')
 
         # Fully Connected
         residual = hidden_states
@@ -208,6 +191,12 @@ class PegasusSuperDecoder(PegasusPreTrainedModel):
         output_hidden_states=None,
         return_dict=None,
     ):
+        # print('\n+++ decoder forward')
+        # print('encoder_hidden_states ', encoder_hidden_states.shape if encoder_hidden_states is not None else None)
+        # print('encoder_attention_mask ', encoder_attention_mask.shape if encoder_attention_mask is not None else None)
+        # print('gat_hidden_states ', gat_hidden_states.shape if gat_hidden_states is not None else None)
+        # print('gat_attention_mask ', gat_attention_mask.shape if gat_attention_mask is not None else None)
+
         assert gat_hidden_states is not None, 'gat_hidden_states is None'
         assert not output_attentions, f'output_attentions is {output_attentions}'
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions

@@ -69,6 +69,43 @@ class Model(PreTrainedModel):
                 model_kwargs["gat_attention_mask"] = gat_attention_mask
         return model_kwargs
 
+    @staticmethod
+    def _expand_inputs_for_generation(
+        input_ids: torch.LongTensor,
+        expand_size: int = 1,
+        is_encoder_decoder: bool = False,
+        attention_mask: torch.LongTensor = None,
+        encoder_outputs = None,
+        gat_outputs = None,
+        gat_attention_mask: torch.LongTensor = None,
+        **model_kwargs,
+    ) -> Tuple[torch.LongTensor, Dict[str, Any]]:
+        expanded_return_idx = (
+            torch.arange(input_ids.shape[0]).view(-1, 1).repeat(1, expand_size).view(-1).to(input_ids.device)
+        )
+        input_ids = input_ids.index_select(0, expanded_return_idx)
+
+        if "token_type_ids" in model_kwargs:
+            token_type_ids = model_kwargs["token_type_ids"]
+            model_kwargs["token_type_ids"] = token_type_ids.index_select(0, expanded_return_idx)
+
+        if attention_mask is not None:
+            model_kwargs["attention_mask"] = attention_mask.index_select(0, expanded_return_idx)
+
+        if gat_attention_mask is not None:
+            model_kwargs["gat_attention_mask"] = gat_attention_mask.index_select(0, expanded_return_idx)
+
+        if is_encoder_decoder:
+            assert encoder_outputs is not None
+            encoder_outputs["last_hidden_state"] = encoder_outputs.last_hidden_state.index_select(
+                0, expanded_return_idx.to(encoder_outputs.last_hidden_state.device)
+            )
+            model_kwargs["encoder_outputs"] = encoder_outputs
+
+            if gat_outputs is not None:
+                model_kwargs["gat_outputs"] = gat_outputs.index_select(0, expanded_return_idx.to(gat_outputs.device))
+        return input_ids, model_kwargs
+
     def prepare_inputs_for_generation(
         self,
         decoder_input_ids,
@@ -85,6 +122,12 @@ class Model(PreTrainedModel):
         if past is not None:
             decoder_input_ids = decoder_input_ids[:, -1:]
 
+        # print('\n+++ prepare_inputs_for_generation')
+        # print('encoder_outputs ', encoder_outputs.last_hidden_state.shape if encoder_outputs is not None else None)
+        # print('attention_mask ', attention_mask.shape if attention_mask is not None else None)
+        # print('gat_outputs ', gat_outputs.shape if gat_outputs is not None else None)
+        # print('gat_attention_mask ', gat_attention_mask.shape if gat_attention_mask is not None else None)
+
         return {
             "input_ids": None,  # encoder_outputs is defined. input_ids not needed
             "encoder_outputs": encoder_outputs,
@@ -100,22 +143,39 @@ class Model(PreTrainedModel):
     def prepare_decoder_input_ids_from_labels(self, labels: torch.Tensor):
         return shift_tokens_right(labels, self.config.pad_token_id, self.config.decoder_start_token_id)
 
+    @torch.no_grad()
     def predict(self, input_ids=None, attention_mask=None, input_nodes_embeddings=None, input_edges=None):
         if self.graph:
             return self.generate(input_ids=input_ids, attention_mask=attention_mask,
                                  input_nodes_embeddings=input_nodes_embeddings, input_edges=input_edges,
-                                 do_sample=True, repetition_penalty=2.5, temperature=1.8,
-                                 min_length=40, max_length=80, num_beams=3, early_stopping=True)
+                                 do_sample=True, repetition_penalty=2.0, temperature=1.2, top_k=50,
+                                 min_length=40, max_length=90, num_beams=2, early_stopping=True)
         else:
             return self.generate(input_ids=input_ids, attention_mask=attention_mask,
-                                 do_sample=True, repetition_penalty=2.5, temperature=1.8,
-                                 min_length=40, max_length=80, num_beams=3, early_stopping=True)
+                                 do_sample=True, repetition_penalty=2.0, temperature=1.2, top_k=50,
+                                 min_length=40, max_length=90, num_beams=2, early_stopping=True)
 
     def forward(self, input_ids=None, attention_mask=None, decoder_input_ids=None,
                 encoder_outputs=None, output_attentions=None, output_hidden_states=None,
-                input_nodes_embeddings=None, input_edges=None, labels=None, gat_hidden_states=None, gat_attention_mask=None, **kwargs):
+                input_nodes_embeddings=None, input_edges=None, labels=None, gat_outputs=None, gat_hidden_states=None, gat_attention_mask=None, **kwargs):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+
+        if gat_outputs is not None:
+            gat_hidden_states = gat_outputs
+
+        # print('\n+++ model forward')
+        # print('encoder')
+        # print('input_ids ', input_ids.shape if input_ids is not None else None)
+        # print('encoder_outputs ', encoder_outputs.last_hidden_state.shape if encoder_outputs is not None else None)
+        # print('attention_mask ', attention_mask.shape if attention_mask is not None else None)
+        #
+        # print('gat')
+        # print('input_nodes_embeddings', [i.shape for i in input_nodes_embeddings] if input_nodes_embeddings is not None else None)
+        # print('input_edges', [i.shape for i in input_edges] if input_edges is not None else None)
+        # print('gat_outputs ', type(gat_outputs), gat_outputs.shape if gat_outputs is not None else None)
+        # print('gat_hidden_states ', gat_hidden_states.shape if gat_hidden_states is not None else None)
+        # print('gat_attention_mask ', gat_attention_mask.shape if gat_attention_mask is not None else None)
 
         if labels is not None:
             if decoder_input_ids is None:
@@ -129,17 +189,11 @@ class Model(PreTrainedModel):
                                            output_hidden_states=output_hidden_states)
 
         if self.graph:
-            # print(f'graph: {type(input_nodes_embeddings)} {type(input_edges)} {type(gat_hidden_states)} {type(gat_attention_mask)}')
             if (input_nodes_embeddings is None or input_edges is None) and (gat_hidden_states is None or gat_attention_mask is None):
                 raise Exception('input_nodes_embeddings & input_edges is None or gat_hidden_states & gat_attention_mask is None')
 
             if gat_hidden_states is None or gat_attention_mask is None:
                 gat_hidden_states, gat_attention_mask = self.gat_model(input_nodes_embeddings, input_edges)
-
-            # print('   gat_hidden_states', gat_hidden_states.shape)
-            # print('   gat_attention_mask', gat_attention_mask.shape)
-            # print('   encoder_hidden_states', encoder_outputs[0].shape)
-            # print('   encoder_attention_mask', attention_mask.shape)
 
             decoder_outputs = self.decoder(encoder_hidden_states=encoder_outputs[0],
                                            encoder_attention_mask=attention_mask,
