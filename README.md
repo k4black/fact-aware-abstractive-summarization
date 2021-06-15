@@ -1,7 +1,7 @@
 # FAAS - Fact Aware Abstractive Summarization model
 
 This repository refers to a bachelor diploma thesis.  
-In this paper, we expand ideas of using source-text knowledge graphs representation along with modern approaches for developing an abstractive text summarization model.
+In this paper, we expand ideas of using source-text knowledge graphs representation along with modern approaches for developing an **abstractive text summarization** model.
 
  
 ### Model
